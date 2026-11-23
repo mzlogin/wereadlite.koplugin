@@ -1025,7 +1025,9 @@ end
 -- Where the reader stood inside a chapter is only known locally: the chapter page
 -- WeRead returns carries its own `chapterOffset`, which only catches up when the
 -- reading progress syncs, so a couple of page turns are lost when reopening a
--- book.  Keep the CRE xpointer of the last page shown, per book.
+-- book.  Keep the CRE xpointer of the last page shown, per book.  The chapter's
+-- URL parameter is kept too: it lets reopening go straight to that chapter
+-- instead of whatever chapter the (possibly stale) book entry page names.
 function Settings.reader_position(book_id)
     book_id = tostring(book_id or "")
     if book_id == "" then
@@ -1037,13 +1039,18 @@ function Settings.reader_position(book_id)
     if type(entry) ~= "table" or type(entry.xpointer) ~= "string" or entry.xpointer == "" then
         return nil
     end
-    return { uid = tostring(entry.uid or ""), xpointer = entry.xpointer }
+    return {
+        uid = tostring(entry.uid or ""),
+        xpointer = entry.xpointer,
+        param = tostring(entry.param or ""),
+    }
 end
 
-function Settings.set_reader_position(book_id, uid, xpointer)
+function Settings.set_reader_position(book_id, uid, xpointer, param)
     book_id = tostring(book_id or "")
     uid = tostring(uid or "")
     xpointer = tostring(xpointer or "")
+    param = tostring(param or "")
     if book_id == "" or xpointer == "" then
         return false
     end
@@ -1053,13 +1060,19 @@ function Settings.set_reader_position(book_id, uid, xpointer)
         positions = {}
     end
     local previous = positions[book_id]
-    if type(previous) == "table" and previous.uid == uid and previous.xpointer == xpointer then
+    -- The chapter cache may already have dropped the URL (e.g. a position saved
+    -- while switching chapters); a later save for the same chapter keeps it.
+    if param == "" and type(previous) == "table" and tostring(previous.uid or "") == uid then
+        param = tostring(previous.param or "")
+    end
+    if type(previous) == "table" and previous.uid == uid
+        and previous.xpointer == xpointer and tostring(previous.param or "") == param then
         return false
     end
-    positions[book_id] = { uid = uid, xpointer = xpointer }
+    positions[book_id] = { uid = uid, xpointer = xpointer, param = param ~= "" and param or nil }
     data:saveSetting("reader_positions", positions)
     data:flush()
-    Log.dbg("settings", "reader_position", { book_id = book_id, uid = uid })
+    Log.dbg("settings", "reader_position", { book_id = book_id, uid = uid, param = param })
     return true
 end
 

@@ -60,7 +60,7 @@ function BookDetail.start_reading(book)
         return true
     end
     if book.reader_url and book.reader_url ~= "" then
-        Reading.open_url(book.reader_url, book, { resume = true })
+        Reading.open_url(book.reader_url, book, { resume = true, entry = true })
         return true
     end
     UIManager:show(InfoMessage:new{

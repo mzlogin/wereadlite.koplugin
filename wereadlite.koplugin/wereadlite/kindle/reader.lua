@@ -289,7 +289,7 @@ local function prune_page_cache()
     Log.info("reader", "page_cache_pruned", { left_bytes = total })
 end
 
-local function read_page_cache(url)
+local function read_page_cache(url, quiet)
     local path = page_cache_path(url)
     local age = file_age(path)
     if not age then
@@ -310,7 +310,9 @@ local function read_page_cache(url)
         os.remove(path)
         return nil
     end
-    Log.info("reader", "page_cache_hit", { url = url, bytes = #body, age = age })
+    if not quiet then
+        Log.info("reader", "page_cache_hit", { url = url, bytes = #body, age = age })
+    end
     return body
 end
 
@@ -383,6 +385,15 @@ end
 local function is_bc(param)
     param = tostring(param or "")
     return #param >= 24 and param:find("^[%w%-_]+$") ~= nil
+end
+
+-- Chapter URL for a chapter parameter, or nil when the value is not a valid
+-- chapter parameter (e.g. an empty setting saved by an old version).
+function Reader.chapter_url(param)
+    if not is_bc(param) then
+        return nil
+    end
+    return Reader.url_for(param)
 end
 
 function Reader.url_for(param, extra)
@@ -833,6 +844,32 @@ function Reader.parse(html)
     }
 end
 
+-- Chapter URL parameter for the page last opened for (book, uid).  The reader
+-- cache keeps the state that was built for every chapter still cached, so this
+-- survives a chapter switch where Reading.state already names the next one.
+function Reader.chapter_param(book_id, uid)
+    local key = uid_key(book_id, uid)
+    local cached = key and chapter_by_uid[key]
+    if not cached then
+        return nil
+    end
+    uid = tostring(uid or "")
+    if cached.cur_param and tostring(cached.cur_param.uid or "") == uid
+        and is_bc(cached.cur_param.param) then
+        return cached.cur_param.param
+    end
+    if cached.cur and tostring(cached.cur.uid or "") == uid and is_bc(cached.cur.param) then
+        return cached.cur.param
+    end
+    if is_bc(cached.chapter_param) then
+        return cached.chapter_param
+    end
+    local param = cached.params and cached.params[uid]
+    if is_bc(param) then
+        return param
+    end
+end
+
 local function query_bc(url)
     return tostring(url or ""):match("[?&]bc=([^&]+)")
 end
@@ -1110,7 +1147,13 @@ function Reader.expand_catalog(state, on_done)
     end
 
     absorb(existing)
-    job.handle = fetch_catalog_page_async(book_id, 3, 0, #existing, function(first, status, err)
+    local first_end = #existing
+    if first_end < 1 then
+        -- Opening a book straight into a chapter (local resume) can start without
+        -- the book entry page, which is where the chapter list normally comes from.
+        first_end = math.max(1, tonumber(Config.API_PAGE_SIZE) or 20)
+    end
+    job.handle = fetch_catalog_page_async(book_id, 3, 0, first_end, function(first, status, err)
         job.handle = nil
         if job.cancelled then
             return
@@ -1156,10 +1199,20 @@ function Reader.expand_catalog(state, on_done)
     return job
 end
 
-function Reader.fetch(url)
-    local cached = read_page_cache(url)
-    if cached then return cached end
-    Log.dbg("reader", "fetch", { url = url })
+-- The book entry page embeds the account's current reading position, so unlike
+-- a chapter page it must not be served from the week-long page cache.  opts.refresh
+-- fetches it again and only falls back to the cached copy when the request fails
+-- (offline), which keeps reopening a book without a network working.
+function Reader.fetch(url, opts)
+    opts = type(opts) == "table" and opts or {}
+    local refresh = opts.refresh == true
+    if not refresh then
+        local cached = read_page_cache(url)
+        if cached then return cached end
+    else
+        Log.info("reader", "page_cache_refresh", { url = url })
+    end
+    Log.dbg("reader", "fetch", { url = url, refresh = refresh })
     local body, status, err = Client.request({
         url = url,
         accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1171,6 +1224,17 @@ function Reader.fetch(url)
         return nil, "auth_expired", err
     end
     if not body or status ~= "ok" then
+        if refresh then
+            local fallback = read_page_cache(url, true)
+            if fallback then
+                Log.info("reader", "fetch_cache_fallback", {
+                    url = url,
+                    status = status,
+                    err = err,
+                })
+                return fallback
+            end
+        end
         Log.warn("reader", "fetch_fail", { url = url, status = status, err = err })
         return nil, status or "http_error", err
     end
@@ -1696,21 +1760,27 @@ local function resolve_bc(state, url)
     return bc
 end
 
-local function fetch_async(url, job, callback)
+local function fetch_async(url, job, callback, opts)
     url = tostring(url or "")
     if job and job.cancelled then
         return
     end
-    local cached = read_page_cache(url)
-    if cached then
-        UIManager:nextTick(function()
-            if not job or not job.cancelled then
-                callback(cached, "ok")
-            end
-        end)
-        return
+    opts = type(opts) == "table" and opts or {}
+    local refresh = opts.refresh == true
+    if not refresh then
+        local cached = read_page_cache(url)
+        if cached then
+            UIManager:nextTick(function()
+                if not job or not job.cancelled then
+                    callback(cached, "ok")
+                end
+            end)
+            return
+        end
+    else
+        Log.info("reader", "page_cache_refresh", { url = url })
     end
-    Log.dbg("reader", "fetch_async", { url = url })
+    Log.dbg("reader", "fetch_async", { url = url, refresh = refresh })
     -- Several section requests may be in flight at once; cancel() aborts them all.
     job.http_active = job.http_active or {}
     local handle
@@ -1731,6 +1801,18 @@ local function fetch_async(url, job, callback)
                 return
             end
             if not res or not res.ok or not res.body or #res.body == 0 then
+                if refresh and (not res or res.status ~= "auth_expired") then
+                    local fallback = read_page_cache(url, true)
+                    if fallback then
+                        Log.info("reader", "fetch_cache_fallback", {
+                            url = url,
+                            status = res and res.status,
+                            err = res and res.err,
+                        })
+                        callback(fallback, "ok")
+                        return
+                    end
+                end
                 callback(nil, res and res.status or "http_error", res and res.err)
                 return
             end
@@ -2232,6 +2314,10 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                 return fail("http_error", "write chapter html failed")
             end
             state.url = url
+            -- The URL parameter of a real chapter page; the book entry page's
+            -- parameter names the book, not a chapter, and must not be saved as
+            -- the chapter to resume to.
+            state.chapter_param = (opts.entry ~= true) and query_bc(url) or nil
             state.html_path = path
             state.html_enc_path = enc_path
             state.chapter_title = chapter_title
@@ -2553,7 +2639,9 @@ local function load_background(url, book, on_progress, on_ready, opts)
                 return not opts.prefetch or job.adopted
             end,
         })
-    end)
+    end, {
+        refresh = opts.entry == true,
+    })
     return nil, "pending", job
 end
 
@@ -2575,7 +2663,7 @@ function Reader.load(url, book, on_progress, on_ready, opts)
         book_id = book.bookId,
         title = book.title,
     })
-    local html, status, err = Reader.fetch(url)
+    local html, status, err = Reader.fetch(url, { refresh = opts.entry == true })
     if not html then
         Log.warn("reader", "load_fetch", { url = url, status = status, err = err })
         return nil, status, err

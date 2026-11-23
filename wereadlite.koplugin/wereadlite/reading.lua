@@ -210,7 +210,7 @@ function Reading.save_reader_position(ui)
     if not xpointer or xpointer == "" then
         return false
     end
-    return Settings.set_reader_position(book_id, uid, xpointer)
+    return Settings.set_reader_position(book_id, uid, xpointer, Reader.chapter_param(book_id, uid))
 end
 
 -- The saved page is only meaningful for the chapter it was taken from.
@@ -226,7 +226,47 @@ local function saved_resume(state)
     if uid == "" or saved.uid ~= uid then
         return nil
     end
-    return { xpointer = saved.xpointer }
+    -- Keep the progress fallbacks too: the chapter markup can change (another
+    -- plugin version, a different section window), and an xpointer that no
+    -- longer validates must not drop the reader at the chapter start.
+    return {
+        xpointer = saved.xpointer,
+        percent = state.resume_percent,
+        anchor = state.resume_anchor,
+    }
+end
+
+-- Reopening a book resumes at the chapter named by the book entry page, which is
+-- the account's synced position: it lags behind this device when the progress
+-- upload has not gone through, and the entry page itself may come from the page
+-- cache days later.  The locally saved page names the chapter actually on screen
+-- last, so when it differs and the opened page knows that chapter's URL, open it
+-- instead of the chapter that was reported.
+local function resume_chapter_redirect(state, opts, current_url)
+    if opts.resume ~= true or opts.redirected then
+        return nil
+    end
+    local ok, saved = pcall(Settings.reader_position, state.book_id)
+    if not ok or type(saved) ~= "table" then
+        return nil
+    end
+    local uid = tostring(saved.uid or "")
+    local entry_uid = state.cur and tostring(state.cur.uid or "") or ""
+    if uid == "" or uid == entry_uid then
+        return nil
+    end
+    local param = state.params and state.params[uid]
+    local url = Reader.chapter_url(param) or Reader.chapter_url(saved.param)
+    -- Never fetch the URL that just produced the wrong chapter again.
+    if not url or url == tostring(current_url or "") then
+        return nil
+    end
+    Log.info("reading", "resume_chapter", {
+        book_id = state.book_id,
+        entry_uid = entry_uid,
+        saved_uid = uid,
+    })
+    return url, uid
 end
 
 local function current_uid()
@@ -903,6 +943,18 @@ function Reading.open_url(url, book, opts)
                 Log.info("reading", "open_cancelled")
                 return
             end
+            -- A chapter saved by an older version may no longer resolve; the book
+            -- entry page is the safe way back in.
+            if opts.fallback_url and not opts.fallback_used and status ~= "auth_expired" then
+                Log.warn("reading", "open_fallback", { status = status, err = err })
+                Reading.open_url(opts.fallback_url, book, {
+                    resume = true,
+                    entry = true,
+                    fallback_used = true,
+                    redirected = true,
+                })
+                return
+            end
             Log.warn("reading", "open_async", { status = status, err = err })
             show_error(status == "offline" and "网络不可用" or "打开章节失败")
             return
@@ -910,7 +962,20 @@ function Reading.open_url(url, book, opts)
         if book then
             Reading.book = book
         end
+        -- Keep the entry page's chapter list (titles/URLs) even when the open is
+        -- redirected below: it is what the table of contents is built from.
         merge_chapters(state)
+        local redirect_url, redirect_uid = resume_chapter_redirect(state, opts, url)
+        if redirect_url then
+            Reading.open_url(redirect_url, book, {
+                resume = true,
+                bar = bar,
+                chapter_uid = redirect_uid,
+                redirected = true,
+                fallback_url = url,
+            })
+            return
+        end
         Reading.state = state
         -- A background prefetch runs the same pipeline as an open, so review
         -- metadata must be activated only when its chapter is actually shown.
@@ -928,6 +993,7 @@ function Reading.open_url(url, book, opts)
                     resume = opts.resume,
                     retried = true,
                     chapter_uid = opts.chapter_uid,
+                    entry = opts.entry,
                 })
             else
                 show_error("打开章节失败")
@@ -1087,14 +1153,39 @@ function Reading.open_book(book)
     end
     book = BookDetail.enrich_reader_param(BookDetail.resolve_owned(book))
     local entry_param = reader_param_from_reader_url(book.reader_url) or book.reader_param
-    local url
+    local entry_url
     if entry_param and entry_param ~= "" then
-        url = Reader.url_for(entry_param)
+        entry_url = Reader.url_for(entry_param)
     elseif book.reader_url and book.reader_url ~= "" then
-        url = book.reader_url
-    else
+        entry_url = book.reader_url
+    end
+    -- Reopen at the chapter actually read last on this device instead of the
+    -- account position carried by the book entry page: that position can lag
+    -- behind (the progress upload runs periodically) and the entry page itself
+    -- may be served from the page cache days later.
+    local saved_uid, resume_url
+    if tostring(book.bookId or "") ~= "" then
+        local ok, saved = pcall(Settings.reader_position, book.bookId)
+        if ok and type(saved) == "table" then
+            resume_url = Reader.chapter_url(saved.param)
+            if resume_url then
+                saved_uid = saved.uid
+            end
+        end
+    end
+    if resume_url and resume_url == entry_url then
+        resume_url, saved_uid = nil, nil
+    end
+    local url = resume_url or entry_url
+    if not url then
         show_error("缺少阅读参数")
         return
+    end
+    if resume_url then
+        Log.info("reading", "resume_chapter_url", {
+            book_id = tostring(book.bookId or ""),
+            uid = tostring(saved_uid or ""),
+        })
     end
     Reading.cancel_load()
     Reading.cancel_catalog()
@@ -1111,7 +1202,13 @@ function Reading.open_book(book)
     Reader.clear_prefetched()
     Reader.cleanup_reading()
     UIManager:nextTick(function()
-        local ok, status, err = Reading.open_url(url, book, { resume = true, bar = bar })
+        local ok, status, err = Reading.open_url(url, book, {
+            resume = true,
+            bar = bar,
+            entry = resume_url == nil,
+            chapter_uid = saved_uid,
+            fallback_url = resume_url and entry_url or nil,
+        })
         if ok then
             UIManager:nextTick(Reader.warm_up)
             return
