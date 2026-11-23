@@ -295,15 +295,39 @@ function Plugin:onSuspend()
     lifecycle.generation = lifecycle.generation + 1
     lifecycle.resume_pending = false
     self:_cancelHeartbeatResume()
-    Reading.cancel_load()
-    Reading.cancel_prefetch()
-    Session.cancel_refresh()
+
+    -- This runs on the power-button path: one failing cleanup step must not
+    -- abort the rest, or timers/curl could survive across sleep.
+    local function step(name, fn)
+        local ok, err = pcall(fn)
+        if not ok then
+            Log.warn("plugin", "suspend_step", { step = name, err = tostring(err) })
+        end
+        return ok
+    end
+    step("cancel_load", function()
+        -- Do not repaint while the screensaver is being drawn.
+        Reading.cancel_load(nil, true)
+    end)
+    step("cancel_prefetch", function()
+        Reading.cancel_prefetch()
+    end)
+    step("cancel_session", function()
+        Session.cancel_refresh()
+    end)
     -- Keep heartbeat state so resume can continue; only cancel in-flight work.
-    Heartbeat.pause("suspend")
-    local cancelled = Http.cancel_all()
+    step("pause_heartbeat", function()
+        Heartbeat.pause("suspend")
+    end)
+    local cancelled = 0
+    step("cancel_http", function()
+        cancelled = Http.cancel_all()
+    end)
     local orphans = 0
     if type(Http.kill_orphans) == "function" then
-        orphans = Http.kill_orphans() or 0
+        step("kill_orphans", function()
+            orphans = Http.kill_orphans() or 0
+        end)
     end
     Log.info("plugin", "suspend", {
         cancelled_http = cancelled,

@@ -999,6 +999,24 @@ function Http.cancel_all()
 end
 
 --- Best-effort: kill leftover curl shells under our http cache (Kindle suspend).
+-- A pid file can outlive its job (crash, suspend) and Kindle reuses PIDs, so
+-- only signal a PID that still looks like one of our jobs.
+local function kill_orphan_pid(pid, dir)
+    if not pid or pid <= 1 then
+        return false
+    end
+    local cmdline = read_file("/proc/" .. tostring(pid) .. "/cmdline")
+    if not cmdline or cmdline == "" then
+        return false
+    end
+    if not cmdline:find(dir, 1, true) and not cmdline:find("wereadlite", 1, true) then
+        return false
+    end
+    pcall(os.execute, "pkill -9 -P " .. tostring(pid) .. " >/dev/null 2>&1")
+    pcall(os.execute, "kill -9 " .. tostring(pid) .. " >/dev/null 2>&1")
+    return true
+end
+
 function Http.kill_orphans()
     local dir = Paths.http_dir()
     if not dir or dir == "" then
@@ -1007,24 +1025,30 @@ function Http.kill_orphans()
     local killed = 0
     local lfs_ok, lfs = pcall(require, "libs/libkoreader-lfs")
     if lfs_ok and lfs then
-        local ok, iter = pcall(lfs.dir, dir)
+        -- pcall(lfs.dir) returns (true, iterator, directory): keep all three,
+        -- otherwise the generic for passes no directory state to the iterator.
+        local ok, iter, dir_obj = pcall(lfs.dir, dir)
         if ok and iter then
-            for name in iter do
+            for name in iter, dir_obj do
                 if name ~= "." and name ~= ".." then
                     local pid_path = dir .. "/" .. name .. "/pid"
                     local pid = tonumber((read_file(pid_path) or ""):match("%d+"))
-                    if pid then
-                        os.execute("pkill -9 -P " .. tostring(pid) .. " >/dev/null 2>&1")
-                        os.execute("kill -9 " .. tostring(pid) .. " >/dev/null 2>&1")
+                    if kill_orphan_pid(pid, dir) then
                         killed = killed + 1
                     end
                 end
             end
         end
     end
-    -- Fallback pattern match (BusyBox pkill on Kindle).
-    os.execute("pkill -9 -f wereadlite.koplugin/.*/cache/http/ >/dev/null 2>&1")
-    os.execute("pkill -9 -f wereadlite.koplugin/cache/http/ >/dev/null 2>&1")
+    -- The pid file may be gone or stale; also match the command line the
+    -- launcher writes, which always carries the cache path.
+    for _, pattern in ipairs({
+        dir,
+        "wereadlite.koplugin/.*/cache/http/",
+        "wereadlite.koplugin/cache/http/",
+    }) do
+        pcall(os.execute, "pkill -9 -f " .. sh_quote(pattern) .. " >/dev/null 2>&1")
+    end
     return killed
 end
 

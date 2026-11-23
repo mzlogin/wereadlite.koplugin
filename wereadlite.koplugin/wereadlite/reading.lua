@@ -871,18 +871,21 @@ function Reading.open_url(url, book, opts)
     -- chapters never reach this point: they are served before the box is asked
     -- for, so there is nothing to flash.
     local function report(stage, done, total)
-        if bar and Settings.show_chapter_load_progress() then
+        -- A load cancelled at suspend (or replaced by another open) may still
+        -- get a late callback; never repaint a box that was already closed.
+        if not bar or Reading._load_bar ~= bar then
+            return
+        end
+        if Settings.show_chapter_load_progress() then
             pcall(bar.update, bar, stage, done, total)
-        elseif bar and not Settings.show_chapter_load_progress() then
+        elseif not bar._minimal_set then
             -- Minimal mode: keep a static "正在加载" title with cancel only.
-            if not bar._minimal_set then
-                bar._minimal_set = true
-                pcall(function()
-                    bar.title_widget:setText("正在加载…")
-                    bar.subtitle_widget:setText(" ")
-                    bar:paint()
-                end)
-            end
+            bar._minimal_set = true
+            pcall(function()
+                bar.title_widget:setText("正在加载…")
+                bar.subtitle_widget:setText(" ")
+                bar:paint()
+            end)
         end
     end
     -- Safety net: if the reader never comes up, do not leave the box on screen.
@@ -1121,7 +1124,8 @@ function Reading.open_url(url, book, opts)
 end
 
 -- keep_bar: the box is handed over to the load that is starting, so it stays up.
-function Reading.cancel_load(keep_bar)
+-- quiet: do not repaint (used at suspend, while the screensaver is drawn).
+function Reading.cancel_load(keep_bar, quiet)
     Reading._load_generation = (Reading._load_generation or 0) + 1
     Reading._continuing_sections = false
     local task = Reading._load_task
@@ -1132,7 +1136,7 @@ function Reading.cancel_load(keep_bar)
     local bar = Reading._load_bar
     if bar and bar ~= keep_bar then
         Reading._load_bar = nil
-        pcall(bar.close, bar)
+        pcall(bar.close, bar, quiet == true)
     end
     Log.info("reading", "load_cancelled")
 end
